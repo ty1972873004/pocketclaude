@@ -1,0 +1,36 @@
+# PocketClaude
+
+.DS_Store
+*.exe
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+build/
+.env
+*.pem
+*.key
+
+# Go
+agent/bin/
+
+# Flutter/Dart
+client/build/
+client/.dart_tool/
+client/.packages
+client/.pub-cache/
+client/.pub/
+client/pubspec.lock
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+desktop.ini
