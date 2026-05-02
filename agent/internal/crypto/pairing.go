@@ -23,6 +23,8 @@ type PairingData struct {
 	Ed25519PubKey  string `json:"ed25519_pub_key"`
 	RelayURL       string `json:"relay_url"`
 	PairingPort    int    `json:"pairing_port"`
+	TailscaleIP    string `json:"tailscale_ip,omitempty"`
+	APIPort        int    `json:"api_port"`
 }
 
 // PairingResponse is what the mobile client sends back after scanning.
@@ -56,6 +58,31 @@ func getLocalIP() string {
 	return addr.IP.String()
 }
 
+// getTailscaleIP detects a Tailscale interface (100.64.0.0/10 CGNAT range).
+func getTailscaleIP() string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range interfaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP.To4() == nil {
+				continue
+			}
+			ip := ipNet.IP.To4()
+			if ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127 {
+				return ip.String()
+			}
+		}
+	}
+	return ""
+}
+
 // RunPairingFlow starts the pairing process:
 // 1. Displays QR code in terminal
 // 2. Starts temporary WebSocket server
@@ -78,6 +105,8 @@ func RunPairingFlow(kp *KeyPair, cfg *Config) (*PairingResult, error) {
 		Ed25519PubKey: base64.StdEncoding.EncodeToString(kp.Ed25519PublicKey),
 		RelayURL:      cfg.RelayURL,
 		PairingPort:   pairingPort,
+		TailscaleIP:   getTailscaleIP(),
+		APIPort:       cfg.APIPort,
 	}
 
 	qrJSON, err := json.Marshal(pairingData)
@@ -211,6 +240,8 @@ func GeneratePairingQRString(kp *KeyPair, cfg *Config, port int) (string, error)
 		Ed25519PubKey: base64.StdEncoding.EncodeToString(kp.Ed25519PublicKey),
 		RelayURL:      cfg.RelayURL,
 		PairingPort:   port,
+		TailscaleIP:   getTailscaleIP(),
+		APIPort:       cfg.APIPort,
 	}
 
 	qrJSON, err := json.Marshal(pairingData)

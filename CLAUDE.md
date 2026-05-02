@@ -39,7 +39,7 @@ go run ./cmd/ start                                # start daemon
 ```
 Global flags: `--relay` (relay URL), `--port` (local API port, default 9090).
 
-Config stored at `~/.pocketclaude/config.json`.
+Config stored at `~/.pocketclaude/config.json`. Session persistence at `~/.pocketclaude/sessions.json`.
 
 ### Flutter Client
 ```bash
@@ -59,10 +59,11 @@ flutter test                   # run tests
 All inter-component communication uses **JSON-RPC 2.0 over WebSocket**. Binary WebSocket frames are forwarded as-is by the relay (first 32 bytes = null-padded target device ID, rest = encrypted payload).
 
 Core RPC methods:
-- **Sessions**: `session.create`, `session.list`, `session.send_input`, `session.destroy` (Agent handles these via `api.Handler.HandleMessage`)
+- **Sessions**: `session.create`, `session.list`, `session.send_input`, `session.destroy`
 - **Filesystem**: `fs.read_dir`, `fs.read_file`, `fs.write_file`
 - **Git**: `git.status`, `git.diff`, `git.log`
 - **System**: `system.info`
+- **Plugins**: `plugin.list`, `plugin.info`
 - **Relay control**: `device.register`, `device.list_online`, `message.send`, `message.forward`, `presence.heartbeat`
 - **Notifications** (no ID): `session.on_output`, `presence.online`, `presence.offline`
 
@@ -70,18 +71,36 @@ Core RPC methods:
 
 - Key exchange: X25519 DH → shared secret → AES-256-GCM
 - Signing: Ed25519
-- Nonce: incrementing counter per direction (8-byte prefix + GCM ciphertext)
-- Pairing: Agent displays QR (contains agent ID + public keys + relay URL + pairing port), client scans and sends its keys over a temporary WebSocket, both derive the same shared secret
+- Wire format: `[8-byte big-endian nonce counter][AES-256-GCM ciphertext+tag]`
+- Pairing: Agent displays QR (contains agent ID + public keys + relay URL + pairing port + Tailscale IP + API port), client scans and sends its keys over a temporary WebSocket, both derive the same shared secret
+
+### Connection Modes
+
+The client supports two connection modes via `ConnectionManager`:
+1. **Direct connection** (`DirectConnection`) — WebSocket to agent API at `ws://host:port/ws`, auto-detected via Tailscale IP (100.64.0.0/10 range). No encryption wrapper needed for local network; raw JSON-RPC.
+2. **Relay connection** (`RelayConnection`) — WebSocket to cloud relay, E2E-encrypted. Unwraps `message.forward` envelopes automatically.
+
+Strategy: try direct first (5s timeout), fall back to relay. Both extend `ConnectionBase` which provides shared connect/reconnect/heartbeat/encrypt/decrypt logic. `decryptRelayMessages` flag differentiates behavior.
 
 ### Agent Internal Structure
 
 The agent has two paths for handling requests:
-1. **Local WebSocket API** (`api.Server` on `127.0.0.1:PORT`) — direct browser/tool access
+1. **Local WebSocket API** (`api.Server` on `0.0.0.0:PORT`) — direct browser/tool access
 2. **Relay-routed messages** — encrypted messages from mobile client, decrypted then dispatched to same `api.Handler.HandleMessage`
 
-`api.Handler` dispatches to `pty.Manager` for session operations. PTY output is piped back through `broadcast` channel to connected WebSocket clients and relay-forwarded (encrypted) to the mobile client.
+`api.Handler` dispatches session methods directly (`session.create/list/send_input/destroy`) and delegates all other methods to service-layer `HandleRPC` via `dispatchServiceRPC()`:
+- `fs.*` → `fs.Service.HandleRPC`
+- `git.*` → `git.Service.HandleRPC`
+- `system.*` → `process.Monitor.HandleRPC`
+- `plugin.*` → `plugin.Registry.HandleRPC`
+
+PTY output is piped back through `broadcast` channel to connected WebSocket clients and relay-forwarded (encrypted) to the mobile client.
 
 PTY is platform-specific: `creack/pty` on Unix, `conpty` (Windows ConPTY) on Windows. Build tags `//go:build windows` / `//go:build !windows` select the implementation.
+
+**tmux session persistence** (Unix only): When tmux is available, sessions are created inside tmux (`pocketclaude_` prefix). `SessionStore` persists metadata to `~/.pocketclaude/sessions.json`. On agent restart, `RestoreSessions()` re-attaches to existing tmux sessions. Output is captured via polling `capture-pane` at 100ms intervals with diff detection. Windows provides stub implementations.
+
+**Plugin system**: `plugin.Registry` manages plugins implementing the `Plugin` interface (`Info/OnLoad/OnUnload/OnHook`). Plugins subscribe to hooks (`session.created`, `session.destroyed`, `session.input_received`, `session.output_produced`, `fs.file_changed`, `system.command`). `Fire()` dispatches events to all subscribed plugins.
 
 ### Relay Internal Structure
 
@@ -89,9 +108,33 @@ Stateless in-memory design. Per-connection `Router` handles JSON-RPC control mes
 
 ### Flutter Client Structure
 
-Uses **Riverpod** for state management, **go_router** for navigation. Routes: `/` (device list), `/pair` (QR scan), `/session/:deviceId` (coding session), `/settings`.
+Uses **Riverpod** for state management, **go_router** for navigation.
 
-`RelayConnection` manages WebSocket with exponential backoff reconnect (max 10 attempts). `SessionService` wraps JSON-RPC calls for session lifecycle. Crypto uses `pointycastle` for X25519/Ed25519/AES-256-GCM.
+**Routes** (all wrapped in `ShellRoute` with `AdaptiveShell` for tablet layout):
+- `/` — device list with real-time online status via `PresenceWatcher`
+- `/pair` — QR scan or paste pairing URL (QR hidden on web via `kIsWeb`)
+- `/session/:deviceId` — coding session with multi-session tab bar
+  - `/session/:deviceId/files` — file browser
+  - `/session/:deviceId/file-preview` — syntax-highlighted file viewer
+  - `/session/:deviceId/git` — git status
+  - `/session/:deviceId/git-diff` — unified diff viewer
+  - `/session/:deviceId/git-log` — commit history
+- `/settings`
+
+**Key client subsystems:**
+
+- `ConnectionBase` → `RelayConnection` / `DirectConnection`: abstract WebSocket with auto-reconnect, heartbeat, encryption/decryption. `ConnectionManager` selects strategy.
+- `PresenceWatcher`: lightweight relay connection for presence events only, emits `PresenceEvent` stream.
+- `SessionService`: manages `ClaudeSession` instances with `OutputBuffer` + `OutputParser` per session. Multiplexes sessions over single connection, routes output by session_id.
+- `OutputParser` → `OutputBuffer` → `MarkdownRenderer`: streaming pipeline. Parser feeds raw bytes, buffer appends typed chunks (Text/Markdown/CodeBlock), renderer uses `flutter_markdown` + `flutter_highlight`.
+- `FileService` / `GitService`: encrypted RPC wrappers for fs/git operations. Share `SessionContext` (ConnectionBase + targetDeviceId).
+- `SessionTabBar`: horizontal scrollable tabs for open sessions, with add (+) and close buttons.
+- `AdaptiveShell`: responsive layout with 700dp breakpoint. Wide: 280dp sidebar + main content. Narrow: passthrough.
+- Platform abstraction (`platform/`): conditional exports for `dart:io` vs web. `kIsWeb`, `supportsQrScanning`, Tailscale IP detection.
+
+**Keyboard shortcuts**: `Ctrl+Enter` / `Cmd+Enter` sends message via Flutter `Shortcuts`+`Actions` system.
+
+**Plugin system**: Mirrors agent-side API. `PluginRegistry` manages client-side plugins implementing `Plugin` interface with hook-based event subscriptions. Sample: `SessionLoggerPlugin`.
 
 ### Key Dependencies
 
@@ -99,13 +142,17 @@ Uses **Riverpod** for state management, **go_router** for navigation. Routes: `/
 |-----------|----------|
 | Agent | `gorilla/websocket`, `spf13/cobra`, `creack/pty` (Unix), `conpty` (Win), `skip2/go-qrcode`, `golang.org/x/crypto` |
 | Relay | `gorilla/websocket` |
-| Client | `flutter_riverpod`, `go_router`, `web_socket_channel`, `pointycastle`, `mobile_scanner`, `flutter_markdown` |
+| Client | `flutter_riverpod`, `go_router`, `web_socket_channel`, `pointycastle`, `mobile_scanner`, `flutter_markdown`, `flutter_highlight` |
 
 ## Development Notes
 
 - Go modules: `github.com/pocketclaude/agent` and `github.com/pocketclaude/relay` — separate modules, no shared Go package
-- Agent config dir: `~/.pocketclaude/` (key material stored as base64 in JSON config)
-- Agent local API binds to `127.0.0.1` only — external access must go through relay or direct connection
+- Agent config dir: `~/.pocketclaude/` (key material stored as base64 in JSON config, sessions persisted in sessions.json)
+- Agent local API binds to `0.0.0.0` — enables Tailscale/direct connections. Relay connections still E2E-encrypted.
 - The relay never stores or decrypts user data (zero-knowledge forwarding)
-- `fs.Service`, `git.Service`, `process.Monitor`, and `session.Manager` each have their own `HandleRPC` method, but the main `api.Handler` in `handlers.go` directly implements the dispatch (some duplication exists between `api.Handler` and the service-layer `HandleRPC` methods)
-- The project is in early MVP stage (V1) — no tests exist yet for Go code
+- Agent `api.Handler` in `handlers.go` is a thin router — session methods handled directly, all other methods delegated to service-layer `HandleRPC` via prefix dispatch (`dispatchServiceRPC`)
+- tmux stubs exist in `pty/tmux_stub.go` for Windows builds — all tmux functions return errors/false
+- Client platform abstraction uses conditional exports (`export` in `platform.dart`) to avoid `dart:io` imports on web
+- `RelayRpc` helper class provides "send encrypted, wait for decrypted response" pattern with 30s timeout
+- Pairing data now includes `tailscale_ip` and `api_port` for direct connection auto-detection
+- The project has completed V1 MVP + V1.5 + V2.0 features across 6 implementation batches

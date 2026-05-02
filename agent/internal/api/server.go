@@ -8,31 +8,48 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/pocketclaude/agent/internal/pty"
+	git "github.com/pocketclaude/agent/internal/git"
+	process "github.com/pocketclaude/agent/internal/process"
+	plugin "github.com/pocketclaude/agent/internal/plugin"
+	pty "github.com/pocketclaude/agent/internal/pty"
+
+	fs "github.com/pocketclaude/agent/internal/fs"
 )
 
 // Handler manages WebSocket API connections.
 type Handler struct {
-	ptyManager *pty.Manager
-	upgrader   websocket.Upgrader
-	clients    map[*websocket.Conn]bool
-	broadcast  chan JSONRPCNotification
-	mu         sync.Mutex
+	ptyManager    *pty.Manager
+	fsService     *fs.Service
+	gitService    *git.Service
+	procMonitor   *process.Monitor
+	pluginRegistry *plugin.Registry
+	upgrader    websocket.Upgrader
+	clients     map[*websocket.Conn]bool
+	broadcast   chan JSONRPCNotification
+	mu          sync.Mutex
 }
 
-// NewHandler creates a new API handler.
+// NewHandler creates a new API handler with default service instances.
 func NewHandler(ptyMgr *pty.Manager) *Handler {
+	fsSvc, gitSvc, mon := newDefaultServices()
+	return NewHandlerWithServices(ptyMgr, fsSvc, gitSvc, mon, plugin.NewRegistry())
+}
+
+// NewHandlerWithServices creates an API handler with explicit service dependencies.
+func NewHandlerWithServices(ptyMgr *pty.Manager, fsSvc *fs.Service, gitSvc *git.Service, mon *process.Monitor, pluginReg *plugin.Registry) *Handler {
 	h := &Handler{
-		ptyManager: ptyMgr,
-		upgrader:   websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
-		clients:    make(map[*websocket.Conn]bool),
-		broadcast:  make(chan JSONRPCNotification, 256),
+		ptyManager:     ptyMgr,
+		fsService:      fsSvc,
+		gitService:     gitSvc,
+		procMonitor:    mon,
+		pluginRegistry: pluginReg,
+		upgrader:    websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
+		clients:     make(map[*websocket.Conn]bool),
+		broadcast:   make(chan JSONRPCNotification, 256),
 	}
 
-	// Start broadcast goroutine
 	go h.broadcastLoop()
 
-	// Wire PTY output to broadcast
 	ptyMgr.SetOutputHandler(func(sessionID string, data []byte) {
 		h.broadcast <- NewNotification("session.on_output", OutputNotification{
 			SessionID: sessionID,
@@ -85,7 +102,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleMessage processes a raw JSON-RPC message and returns the response.
-// This is used both by WebSocket connections and relay-routed messages.
 func (h *Handler) HandleMessage(raw []byte) *JSONRPCResponse {
 	var req JSONRPCRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -98,6 +114,7 @@ func (h *Handler) HandleMessage(raw []byte) *JSONRPCResponse {
 		return &resp
 	}
 
+	// Try session handlers first (direct PTY operations)
 	var resp JSONRPCResponse
 
 	switch req.Method {
@@ -109,25 +126,15 @@ func (h *Handler) HandleMessage(raw []byte) *JSONRPCResponse {
 		resp = h.handleSendInput(req)
 	case "session.destroy":
 		resp = h.handleSessionDestroy(req)
-	case "fs.read_dir":
-		resp = h.handleReadDir(req)
-	case "fs.read_file":
-		resp = h.handleReadFile(req)
-	case "fs.write_file":
-		resp = h.handleWriteFile(req)
-	case "git.status":
-		resp = h.handleGitStatus(req)
-	case "git.diff":
-		resp = h.handleGitDiff(req)
-	case "git.log":
-		resp = h.handleGitLog(req)
-	case "system.info":
-		resp = h.handleSystemInfo(req)
 	default:
-		resp = NewError(req.ID, ErrMethodNotFound, "method not found: "+req.Method)
+		// Delegate to service-layer HandleRPC
+		if found, ok := h.dispatchServiceRPC(req); ok {
+			resp = found
+		} else {
+			resp = NewError(req.ID, ErrMethodNotFound, "method not found: "+req.Method)
+		}
 	}
 
-	// Only return response for requests (with ID), not notifications
 	if req.ID != nil {
 		return &resp
 	}

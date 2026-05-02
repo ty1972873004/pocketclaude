@@ -3,11 +3,16 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
-import 'package:uuid/uuid.dart';
-import 'package:web_socket_channel/web_socket_channel.dart';
 
+import '../../connection/connection_base.dart';
+import '../../connection/connection_manager.dart';
 import '../../crypto/encryption.dart';
+import '../../session/session_context.dart';
+import '../../session/session_service.dart';
+import '../../terminal/markdown_renderer.dart';
+import '../widgets/session_tab_bar.dart';
 
 class SessionPage extends StatefulWidget {
   final String deviceId;
@@ -21,16 +26,15 @@ class SessionPage extends StatefulWidget {
 class _SessionPageState extends State<SessionPage> {
   final _inputController = TextEditingController();
   final _scrollController = ScrollController();
-  final _outputLines = <String>[];
 
-  WebSocketChannel? _channel;
-  EncryptionService? _encryption;
-  String? _clientId;
-  String? _sessionId;
+  ConnectionManager? _connectionManager;
+  ConnectionBase? _connection;
+  SessionService? _sessionService;
+  final Map<String, ClaudeSession> _sessions = {};
+  String? _activeSessionId;
   bool _connecting = true;
   bool _isSending = false;
   String? _error;
-  int _rpcId = 1;
 
   @override
   void initState() {
@@ -39,187 +43,128 @@ class _SessionPageState extends State<SessionPage> {
   }
 
   void _initFromRoute() {
-    // Extract query params passed from device list
     final state = GoRouterState.of(context);
     final relayUrl = state.uri.queryParameters['relay_url'] ?? '';
     final clientId = state.uri.queryParameters['client_id'] ?? '';
     final sharedKeyB64 = state.uri.queryParameters['shared_key'] ?? '';
-    final deviceName = state.uri.queryParameters['device_name'] ?? widget.deviceId;
 
     if (relayUrl.isEmpty || sharedKeyB64.isEmpty) {
       setState(() {
         _connecting = false;
-        _error = '缺少连接参数，请从设备列表重新进入';
+        _error = 'Missing connection parameters, please re-enter from device list';
       });
       return;
     }
 
-    _clientId = clientId.isEmpty
+    final effectiveClientId = clientId.isEmpty
         ? 'client-${DateTime.now().millisecondsSinceEpoch}'
         : clientId;
 
-    _connectToRelay(relayUrl, sharedKeyB64);
+    final directHost = state.uri.queryParameters['direct_host'] ?? '';
+    final directPort = int.tryParse(state.uri.queryParameters['direct_port'] ?? '') ?? 9090;
+
+    _connect(relayUrl, sharedKeyB64, effectiveClientId, directHost, directPort);
   }
 
-  Future<void> _connectToRelay(String relayUrl, String sharedKeyB64) async {
+  Future<void> _connect(
+    String relayUrl,
+    String sharedKeyB64,
+    String clientId,
+    String directHost,
+    int directPort,
+  ) async {
     try {
       final sharedKey = base64Decode(sharedKeyB64);
-      _encryption = EncryptionService(Uint8List.fromList(sharedKey));
+      final encryption = EncryptionService(Uint8List.fromList(sharedKey));
 
-      final uri = Uri.parse('$relayUrl/ws');
-      _channel = WebSocketChannel.connect(uri);
-      await _channel!.ready;
-
-      // Register with relay
-      _channel!.sink.add(jsonEncode({
-        'jsonrpc': '2.0',
-        'id': 'register',
-        'method': 'device.register',
-        'params': {
-          'device_id': _clientId,
-          'device_type': 'client',
-          'public_key': '',
-        },
-      }));
-
-      // Listen for messages
-      _channel!.stream.listen(
-        _onData,
-        onError: (e) => setState(() {
-          _connecting = false;
-          _error = '连接断开: $e';
-        }),
-        onDone: () {
-          if (mounted) {
-            setState(() {
-              _connecting = false;
-              _error = '连接已关闭';
-            });
-          }
-        },
+      _connectionManager = ConnectionManager(
+        relayUrl: relayUrl,
+        deviceId: clientId,
+        directHost: directHost.isNotEmpty ? directHost : null,
+        directPort: directPort,
+        encryption: encryption,
       );
 
-      // Wait for registration ack then create session
-      await Future.delayed(const Duration(seconds: 1));
-      await _createSession();
+      _connection = await _connectionManager!.connect();
+
+      _connection!.statusStream.listen((status) {
+        if (!mounted) return;
+        if (status == ConnectionStatus.error) {
+          setState(() {
+            _connecting = false;
+            _error = 'Connection error';
+          });
+        }
+      });
+
+      _sessionService = SessionService(_connection!);
+
+      await _createNewSession();
+
+      if (!mounted) return;
     } catch (e) {
       if (mounted) {
         setState(() {
           _connecting = false;
-          _error = '连接失败: $e';
+          _error = 'Connection failed: $e';
         });
       }
     }
   }
 
-  Future<void> _createSession() async {
-    _sessionId = const Uuid().v4();
-    final request = {
-      'jsonrpc': '2.0',
-      'id': '${_rpcId++}',
-      'method': 'session.create',
-      'params': {
-        'session_id': _sessionId,
-        'project_dir': '',
-        'command': 'claude',
-      },
-    };
-
-    _sendEncrypted(request);
-    setState(() => _connecting = false);
-  }
-
-  void _sendEncrypted(Map<String, dynamic> request) {
-    if (_encryption == null || _channel == null) return;
-
-    final plaintext = Uint8List.fromList(utf8.encode(jsonEncode(request)));
-    final encrypted = _encryption!.encrypt(plaintext);
-
-    _channel!.sink.add(jsonEncode({
-      'jsonrpc': '2.0',
-      'id': '${_rpcId++}',
-      'method': 'message.send',
-      'params': {
-        'target_id': widget.deviceId,
-        'encrypted_payload': base64Encode(encrypted),
-      },
-    }));
-  }
-
-  void _onData(dynamic data) {
-    if (data is! String) return;
-
-    try {
-      final msg = jsonDecode(data) as Map<String, dynamic>;
-      final method = msg['method'] as String?;
-
-      if (method == 'message.forward' || method == 'message.relay') {
-        final params = msg['params'] as Map<String, dynamic>?;
-        if (params == null) return;
-
-        final payload = params['encrypted_payload'];
-        if (payload == null || _encryption == null) return;
-
-        Uint8List cipherBytes;
-        if (payload is String) {
-          cipherBytes = Uint8List.fromList(base64Decode(payload));
-        } else if (payload is List) {
-          cipherBytes = Uint8List.fromList(List<int>.from(payload));
-        } else {
-          return;
-        }
-
-        final decrypted = _encryption!.decrypt(cipherBytes);
-        final decryptedStr = utf8decode(decrypted);
-
-        final innerMsg =
-            jsonDecode(decryptedStr) as Map<String, dynamic>;
-        final innerMethod = innerMsg['method'] as String?;
-
-        if (innerMethod == 'session.on_output') {
-          final p = innerMsg['params'] as Map<String, dynamic>?;
-          final outputData = p?['data'] as String? ?? '';
-          if (outputData.isNotEmpty && mounted) {
-            setState(() {
-              _outputLines.add(outputData);
-            });
-            _scrollToBottom();
-          }
-        }
-      }
-    } catch (e) {
-      debugPrint('Message parse error: $e');
-    }
-  }
-
-  String utf8decode(Uint8List bytes) {
-    return utf8.decode(bytes, allowMalformed: true);
-  }
-
   void _sendMessage() {
     final input = _inputController.text.trim();
-    if (input.isEmpty || _sessionId == null) return;
+    final session = _activeSession != null ? _sessions[_activeSessionId] : null;
+    if (input.isEmpty || _sessionService == null || _activeSessionId == null) return;
 
     setState(() => _isSending = true);
     _inputController.clear();
 
-    final request = {
-      'jsonrpc': '2.0',
-      'id': '${_rpcId++}',
-      'method': 'session.send_input',
-      'params': {
-        'session_id': _sessionId,
-        'input': input,
-      },
-    };
+    _sessionService!.sendInput(_activeSessionId!, input);
 
-    _sendEncrypted(request);
+    setState(() => _isSending = false);
+    _scrollToBottom();
+  }
+
+  ClaudeSession? get _activeSession =>
+      _activeSessionId != null ? _sessions[_activeSessionId] : null;
+
+  Future<void> _createNewSession() async {
+    if (_sessionService == null) return;
+
+    final session = await _sessionService!.createSession(
+      deviceId: widget.deviceId,
+      command: 'claude',
+    );
+
+    if (!mounted) return;
 
     setState(() {
-      _isSending = false;
-      _outputLines.add('> $input');
+      _sessions[session.id] = session;
+      _activeSessionId = session.id;
+      _connecting = false;
     });
+
+    session.outputBuffer.changeNotifier.addListener(_scrollToBottom);
+  }
+
+  void _switchSession(String sessionId) {
+    if (!_sessions.containsKey(sessionId)) return;
+    setState(() => _activeSessionId = sessionId);
     _scrollToBottom();
+  }
+
+  void _closeSession(String sessionId) {
+    final session = _sessions[sessionId];
+    session?.outputBuffer.changeNotifier.removeListener(_scrollToBottom);
+    _sessionService?.destroySession(sessionId);
+
+    setState(() {
+      _sessions.remove(sessionId);
+      if (_activeSessionId == sessionId) {
+        _activeSessionId = _sessions.keys.isNotEmpty ? _sessions.keys.first : null;
+      }
+    });
   }
 
   void _scrollToBottom() {
@@ -238,7 +183,10 @@ class _SessionPageState extends State<SessionPage> {
   void dispose() {
     _inputController.dispose();
     _scrollController.dispose();
-    _channel?.sink.close();
+    for (final s in _sessions.values) {
+      s.outputBuffer.changeNotifier.removeListener(_scrollToBottom);
+    }
+    _connectionManager?.dispose();
     super.dispose();
   }
 
@@ -251,18 +199,42 @@ class _SessionPageState extends State<SessionPage> {
       ),
       body: Column(
         children: [
-          _StatusBar(deviceId: widget.deviceId, connected: !_connecting && _error == null),
+          _StatusBar(
+            deviceId: widget.deviceId,
+            connected: !_connecting && _error == null,
+          ),
+          if (_sessions.length > 1)
+            SessionTabBar(
+              tabs: _sessions.entries.map((e) => SessionTab(
+                sessionId: e.key,
+                label: 'Session ${_sessionIndex(e.key)}',
+              )).toList(),
+              activeSessionId: _activeSessionId ?? '',
+              onTabSelected: _switchSession,
+              onNewSession: _createNewSession,
+              onCloseSession: _closeSession,
+            ),
           Expanded(child: _buildOutput()),
-          const _QuickActionBar(),
+          _QuickActionBar(
+            sessionContext: _connection != null
+                ? SessionContext(connection: _connection!, targetDeviceId: widget.deviceId)
+                : null,
+            projectDir: _activeSession?.projectDir ?? '',
+          ),
           _InputArea(
             controller: _inputController,
             isSending: _isSending,
             onSend: _sendMessage,
-            enabled: !_connecting && _error == null,
+            enabled: !_connecting && _error == null && _activeSessionId != null,
           ),
         ],
       ),
     );
+  }
+
+  int _sessionIndex(String id) {
+    final keys = _sessions.keys.toList();
+    return keys.indexOf(id) + 1;
   }
 
   Widget _buildOutput() {
@@ -273,7 +245,7 @@ class _SessionPageState extends State<SessionPage> {
           children: [
             CircularProgressIndicator(),
             SizedBox(height: 16),
-            Text('正在连接...', style: TextStyle(color: Colors.grey)),
+            Text('Connecting...', style: TextStyle(color: Colors.grey)),
           ],
         ),
       );
@@ -292,7 +264,7 @@ class _SessionPageState extends State<SessionPage> {
               const SizedBox(height: 16),
               ElevatedButton(
                 onPressed: () => context.go('/'),
-                child: const Text('返回设备列表'),
+                child: const Text('Return to Device List'),
               ),
             ],
           ),
@@ -300,40 +272,14 @@ class _SessionPageState extends State<SessionPage> {
       );
     }
 
-    if (_outputLines.isEmpty) {
-      return const Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.terminal, size: 48, color: Colors.grey),
-            SizedBox(height: 12),
-            Text('输入 prompt 开始 coding',
-                style: TextStyle(color: Colors.grey)),
-          ],
-        ),
-      );
+    final session = _activeSession;
+    if (session == null) {
+      return const SizedBox.shrink();
     }
 
-    return ListView.builder(
-      controller: _scrollController,
-      padding: const EdgeInsets.all(12),
-      itemCount: _outputLines.length,
-      itemBuilder: (context, index) {
-        final line = _outputLines[index];
-        final isInput = line.startsWith('> ');
-        return Padding(
-          padding: const EdgeInsets.symmetric(vertical: 1),
-          child: SelectableText(
-            line,
-            style: TextStyle(
-              fontFamily: 'JetBrainsMono',
-              fontSize: 13,
-              height: 1.5,
-              color: isInput ? const Color(0xFF6C63FF) : null,
-            ),
-          ),
-        );
-      },
+    return MarkdownRenderer(
+      buffer: session.outputBuffer,
+      scrollController: _scrollController,
     );
   }
 }
@@ -368,7 +314,7 @@ class _StatusBar extends StatelessWidget {
           ),
           const Spacer(),
           Text(
-            connected ? '已连接' : '未连接',
+            connected ? 'Connected' : 'Disconnected',
             style: TextStyle(
               fontSize: 12,
               color: connected ? Colors.green : Colors.grey,
@@ -381,7 +327,10 @@ class _StatusBar extends StatelessWidget {
 }
 
 class _QuickActionBar extends StatelessWidget {
-  const _QuickActionBar();
+  final SessionContext? sessionContext;
+  final String projectDir;
+
+  const _QuickActionBar({this.sessionContext, this.projectDir = ''});
 
   @override
   Widget build(BuildContext context) {
@@ -390,6 +339,29 @@ class _QuickActionBar extends StatelessWidget {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
+          _QuickAction(
+            icon: Icons.folder_open,
+            label: 'Files',
+            onTap: sessionContext != null
+                ? () => context.push(
+                      '/session/${sessionContext!.targetDeviceId}/files',
+                      extra: sessionContext,
+                    )
+                : () {},
+          ),
+          _QuickAction(
+            icon: Icons.call_split,
+            label: 'Git',
+            onTap: sessionContext != null
+                ? () => context.push(
+                      '/session/${sessionContext!.targetDeviceId}/git',
+                      extra: GitRouteArgs(
+                        sessionContext: sessionContext!,
+                        projectDir: projectDir,
+                      ),
+                    )
+                : () {},
+          ),
           _QuickAction(icon: Icons.stop, label: 'Ctrl+C', onTap: () {}),
         ],
       ),
@@ -444,59 +416,88 @@ class _InputArea extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
-      decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surface,
-        border: Border(
-          top: BorderSide(
-              color: Theme.of(context).dividerColor.withOpacity(0.3)),
-        ),
-      ),
-      child: SafeArea(
-        top: false,
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            Expanded(
-              child: TextField(
-                controller: controller,
-                enabled: enabled,
-                maxLines: 4,
-                minLines: 1,
-                textInputAction: TextInputAction.newline,
-                style: const TextStyle(
-                    fontFamily: 'JetBrainsMono', fontSize: 14),
-                decoration: InputDecoration(
-                  hintText: '输入 prompt...',
-                  hintStyle: const TextStyle(color: Colors.grey),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
-                    borderSide: BorderSide.none,
+    return Shortcuts(
+      shortcuts: <LogicalKeySet, Intent>{
+        LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.enter):
+            const _SendIntent(),
+        LogicalKeySet(LogicalKeyboardKey.meta, LogicalKeyboardKey.enter):
+            const _SendIntent(),
+      },
+      child: Actions(
+        actions: <Type, Action<Intent>>{
+          _SendIntent: _SendAction(onSend),
+        },
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.surface,
+            border: Border(
+              top: BorderSide(
+                  color: Theme.of(context).dividerColor.withOpacity(0.3)),
+            ),
+          ),
+          child: SafeArea(
+            top: false,
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: controller,
+                    enabled: enabled,
+                    maxLines: 4,
+                    minLines: 1,
+                    textInputAction: TextInputAction.newline,
+                    style: const TextStyle(
+                        fontFamily: 'JetBrainsMono', fontSize: 14),
+                    decoration: InputDecoration(
+                      hintText: 'Enter prompt...',
+                      hintStyle: const TextStyle(color: Colors.grey),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none,
+                      ),
+                      filled: true,
+                      fillColor:
+                          Theme.of(context).colorScheme.surfaceContainerHighest,
+                      contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 10),
+                    ),
+                    onSubmitted: (_) => onSend(),
                   ),
-                  filled: true,
-                  fillColor:
-                      Theme.of(context).colorScheme.surfaceContainerHighest,
-                  contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 16, vertical: 10),
                 ),
-                onSubmitted: (_) => onSend(),
-              ),
+                const SizedBox(width: 8),
+                IconButton.filled(
+                  onPressed: enabled && !isSending ? onSend : null,
+                  icon: isSending
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.send),
+                ),
+              ],
             ),
-            const SizedBox(width: 8),
-            IconButton.filled(
-              onPressed: enabled && !isSending ? onSend : null,
-              icon: isSending
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.send),
-            ),
-          ],
+          ),
         ),
       ),
     );
+  }
+}
+
+class _SendIntent extends Intent {
+  const _SendIntent();
+}
+
+class _SendAction extends Action<_SendIntent> {
+  final VoidCallback onSend;
+
+  _SendAction(this.onSend);
+
+  @override
+  Object? invoke(_SendIntent intent) {
+    onSend();
+    return null;
   }
 }

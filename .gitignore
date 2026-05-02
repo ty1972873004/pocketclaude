@@ -23,6 +23,12 @@ client/.pub-cache/
 client/.pub/
 client/pubspec.lock
 
+# Claude Code
+.claude/
+
+# Flutter metadata
+client/.metadata
+
 # IDE
 .idea/
 .vscode/

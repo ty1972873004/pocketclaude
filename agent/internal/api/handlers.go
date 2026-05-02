@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
-	"runtime"
-	"strings"
+
+	git "github.com/pocketclaude/agent/internal/git"
+	process "github.com/pocketclaude/agent/internal/process"
+
+	fs "github.com/pocketclaude/agent/internal/fs"
 )
 
 func (h *Handler) handleSessionCreate(req JSONRPCRequest) JSONRPCResponse {
@@ -73,123 +75,47 @@ func (h *Handler) handleSessionDestroy(req JSONRPCRequest) JSONRPCResponse {
 	return NewResponse(req.ID, map[string]bool{"success": true})
 }
 
-func (h *Handler) handleReadDir(req JSONRPCRequest) JSONRPCResponse {
-	var params ReadDirParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return NewError(req.ID, ErrInvalidParams, "invalid params")
+// dispatchServiceRPC delegates a method to the appropriate service HandleRPC.
+func (h *Handler) dispatchServiceRPC(req JSONRPCRequest) (JSONRPCResponse, bool) {
+	var handler func(string, json.RawMessage) (interface{}, error)
+
+	switch {
+	case hasPrefix(req.Method, "fs."):
+		handler = h.fsService.HandleRPC
+	case hasPrefix(req.Method, "git."):
+		handler = h.gitService.HandleRPC
+	case hasPrefix(req.Method, "system."):
+		handler = h.procMonitor.HandleRPC
+	case hasPrefix(req.Method, "plugin."):
+		handler = h.pluginRegistry.HandleRPC
+	default:
+		return JSONRPCResponse{}, false
 	}
 
-	path := params.Path
+	result, err := handler(req.Method, req.Params)
+	if err != nil {
+		return NewError(req.ID, ErrInternal, err.Error()), true
+	}
+	return NewResponse(req.ID, result), true
+}
+
+func hasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+// newDefaultServices creates default service instances for standalone use.
+func newDefaultServices() (*fs.Service, *git.Service, *process.Monitor) {
+	return fs.NewService(), git.NewService(), process.NewMonitor()
+}
+
+// ResolvePath resolves relative paths to absolute paths (for convenience).
+func ResolvePath(path string) string {
 	if path == "" {
-		path, _ = os.UserHomeDir()
+		home, _ := os.UserHomeDir()
+		return home
 	}
-
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return NewError(req.ID, ErrInternal, err.Error())
-	}
-
-	type DirEntry struct {
-		Name  string `json:"name"`
-		IsDir bool   `json:"is_dir"`
-		Size  int64  `json:"size,omitempty"`
-	}
-
-	result := make([]DirEntry, 0, len(entries))
-	for _, e := range entries {
-		info, _ := e.Info()
-		result = append(result, DirEntry{
-			Name:  e.Name(),
-			IsDir: e.IsDir(),
-			Size:  info.Size(),
-		})
-	}
-
-	return NewResponse(req.ID, map[string]any{"path": path, "entries": result})
+	return path
 }
 
-func (h *Handler) handleReadFile(req JSONRPCRequest) JSONRPCResponse {
-	var params ReadFileParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return NewError(req.ID, ErrInvalidParams, "invalid params")
-	}
-
-	data, err := os.ReadFile(params.Path)
-	if err != nil {
-		return NewError(req.ID, ErrInternal, err.Error())
-	}
-
-	return NewResponse(req.ID, map[string]string{"path": params.Path, "content": string(data)})
-}
-
-func (h *Handler) handleWriteFile(req JSONRPCRequest) JSONRPCResponse {
-	var params WriteFileParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return NewError(req.ID, ErrInvalidParams, "invalid params")
-	}
-
-	if err := os.WriteFile(params.Path, []byte(params.Content), 0644); err != nil {
-		return NewError(req.ID, ErrInternal, err.Error())
-	}
-
-	return NewResponse(req.ID, map[string]bool{"success": true})
-}
-
-func (h *Handler) handleGitStatus(req JSONRPCRequest) JSONRPCResponse {
-	var params GitStatusParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return NewError(req.ID, ErrInvalidParams, "invalid params")
-	}
-
-	out, err := exec.Command("git", "-C", params.Path, "status", "--porcelain").Output()
-	if err != nil {
-		return NewError(req.ID, ErrInternal, err.Error())
-	}
-
-	return NewResponse(req.ID, map[string]string{"status": string(out)})
-}
-
-func (h *Handler) handleGitDiff(req JSONRPCRequest) JSONRPCResponse {
-	var params GitDiffParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return NewError(req.ID, ErrInvalidParams, "invalid params")
-	}
-
-	out, err := exec.Command("git", "-C", params.Path, "diff").Output()
-	if err != nil {
-		return NewError(req.ID, ErrInternal, err.Error())
-	}
-
-	return NewResponse(req.ID, map[string]string{"diff": string(out)})
-}
-
-func (h *Handler) handleGitLog(req JSONRPCRequest) JSONRPCResponse {
-	var params GitLogParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return NewError(req.ID, ErrInvalidParams, "invalid params")
-	}
-
-	count := params.Count
-	if count <= 0 {
-		count = 20
-	}
-
-	out, err := exec.Command("git", "-C", params.Path, "log", fmt.Sprintf("-%d", count), "--oneline").Output()
-	if err != nil {
-		return NewError(req.ID, ErrInternal, err.Error())
-	}
-
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	return NewResponse(req.ID, map[string]any{"log": lines})
-}
-
-func (h *Handler) handleSystemInfo(req JSONRPCRequest) JSONRPCResponse {
-	hostname, _ := os.Hostname()
-	info := SystemInfoResult{
-		OS:       runtime.GOOS,
-		Arch:     runtime.GOARCH,
-		Hostname: hostname,
-		CPUCount: runtime.NumCPU(),
-	}
-	return NewResponse(req.ID, info)
-}
+// Compile-time interface check.
+var _ = fmt.Sprintf

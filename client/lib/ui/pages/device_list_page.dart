@@ -1,28 +1,27 @@
-import 'dart:convert';
-import 'dart:typed_data';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
-import 'package:web_socket_channel/web_socket_channel.dart';
 
-import '../../connection/relay_connection.dart';
-import '../../crypto/encryption.dart';
+import '../../connection/presence_watcher.dart';
 import '../../models/paired_device.dart';
 import '../../storage/device_storage.dart';
 import '../widgets/device_card.dart';
 
-class DeviceListPage extends ConsumerStatefulWidget {
+class DeviceListPage extends StatefulWidget {
   const DeviceListPage({super.key});
 
   @override
-  ConsumerState<DeviceListPage> createState() => _DeviceListPageState();
+  State<DeviceListPage> createState() => _DeviceListPageState();
 }
 
-class _DeviceListPageState extends ConsumerState<DeviceListPage> {
+class _DeviceListPageState extends State<DeviceListPage> {
   List<PairedDevice> _devices = [];
+  final Set<String> _onlineDeviceIds = {};
   bool _loading = true;
   String? _connectError;
+  PresenceWatcher? _presenceWatcher;
+  StreamSubscription<PresenceEvent>? _presenceSub;
 
   @override
   void initState() {
@@ -37,58 +36,63 @@ class _DeviceListPageState extends ConsumerState<DeviceListPage> {
         _devices = devices;
         _loading = false;
       });
+      _startPresenceWatcher();
     }
+  }
+
+  void _startPresenceWatcher() {
+    _presenceWatcher?.dispose();
+
+    // Find a relay URL from any device
+    final relayUrl = _devices
+        .where((d) => d.relayUrl.isNotEmpty)
+        .map((d) => d.relayUrl)
+        .firstOrNull;
+    if (relayUrl == null) return;
+
+    _presenceWatcher = PresenceWatcher(
+      relayUrl: relayUrl,
+      clientId: 'watcher-${DateTime.now().millisecondsSinceEpoch}',
+    );
+
+    _presenceSub?.cancel();
+    _presenceSub = _presenceWatcher!.events.listen((event) {
+      if (!mounted) return;
+      setState(() {
+        if (event.online) {
+          _onlineDeviceIds.add(event.deviceId);
+        } else {
+          _onlineDeviceIds.remove(event.deviceId);
+        }
+      });
+    });
+
+    _presenceWatcher!.connect();
   }
 
   Future<void> _connectToDevice(PairedDevice device) async {
     setState(() => _connectError = null);
 
-    try {
-      final sharedKey = base64Decode(device.sharedKeyBase64);
-      final encryption = EncryptionService(
-        Uint8List.fromList(sharedKey),
-      );
+    final relayUrl = device.relayUrl;
+    if (relayUrl.isEmpty) {
+      setState(() => _connectError = 'Device has no relay URL configured');
+      return;
+    }
 
-      // Connect to relay
-      final relayUrl = device.relayUrl;
-      if (relayUrl.isEmpty) {
-        throw Exception('设备未配置 Relay 地址，请到设置页配置');
-      }
+    final clientId = 'client-${DateTime.now().millisecondsSinceEpoch}';
 
-      final clientId = 'client-${DateTime.now().millisecondsSinceEpoch}';
-      final uri = Uri.parse('$relayUrl/ws');
-      final wsChannel = WebSocketChannel.connect(uri);
-      await wsChannel.ready;
+    if (mounted) {
+      final directHost = device.tailscaleIP.isNotEmpty
+          ? device.tailscaleIP
+          : device.agentIP;
 
-      // Register with relay
-      final registerMsg = {
-        'jsonrpc': '2.0',
-        'id': 'register',
-        'method': 'device.register',
-        'params': {
-          'device_id': clientId,
-          'device_type': 'client',
-          'public_key': device.clientX25519PubKey,
-        },
-      };
-      wsChannel.sink.add(jsonEncode(registerMsg));
-
-      // Wait for registration ack
-      await wsChannel.stream.first
-          .timeout(const Duration(seconds: 5));
-
-      if (mounted) {
-        // Pass connection details to session page via query params
-        context.push('/session/${device.agentId}'
-            '?relay_url=${Uri.encodeComponent(relayUrl)}'
-            '&client_id=${Uri.encodeComponent(clientId)}'
-            '&shared_key=${Uri.encodeComponent(device.sharedKeyBase64)}'
-            '&device_name=${Uri.encodeComponent(device.deviceName)}');
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() => _connectError = '连接失败: $e');
-      }
+      context.push('/session/${device.agentId}'
+          '?relay_url=${Uri.encodeComponent(relayUrl)}'
+          '&client_id=${Uri.encodeComponent(clientId)}'
+          '&shared_key=${Uri.encodeComponent(device.sharedKeyBase64)}'
+          '&device_name=${Uri.encodeComponent(device.deviceName)}'
+          '&direct_host=${Uri.encodeComponent(directHost)}'
+          '&direct_port=${device.directPort}');
     }
   }
 
@@ -98,9 +102,14 @@ class _DeviceListPageState extends ConsumerState<DeviceListPage> {
   }
 
   @override
-  Widget build(BuildContext context) {
-    final connectionStatus = ref.watch(relayConnectionProvider);
+  void dispose() {
+    _presenceSub?.cancel();
+    _presenceWatcher?.dispose();
+    super.dispose();
+  }
 
+  @override
+  Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('PocketClaude'),
@@ -110,7 +119,7 @@ class _DeviceListPageState extends ConsumerState<DeviceListPage> {
             icon: const Icon(Icons.settings),
             onPressed: () async {
               await context.push('/settings');
-              _loadDevices(); // reload in case relay URL changed
+              _loadDevices();
             },
           ),
         ],
@@ -119,10 +128,10 @@ class _DeviceListPageState extends ConsumerState<DeviceListPage> {
       floatingActionButton: FloatingActionButton.extended(
         onPressed: () async {
           await context.push('/pair');
-          _loadDevices(); // reload after pairing
+          _loadDevices();
         },
         icon: const Icon(Icons.qr_code_scanner),
-        label: const Text('添加设备'),
+        label: const Text('Add Device'),
       ),
     );
   }
@@ -136,38 +145,33 @@ class _DeviceListPageState extends ConsumerState<DeviceListPage> {
       onRefresh: _loadDevices,
       child: CustomScrollView(
         slivers: [
-          // Error banner
           if (_connectError != null)
             SliverToBoxAdapter(
               child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                color: Colors.red.withOpacity(0.1),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                color: Colors.red.withValues(alpha: 0.1),
                 child: Row(
                   children: [
                     const Icon(Icons.error, color: Colors.red, size: 16),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(_connectError!,
-                          style:
-                              const TextStyle(color: Colors.red, fontSize: 13)),
+                          style: const TextStyle(color: Colors.red, fontSize: 13)),
                     ),
                     IconButton(
                       icon: const Icon(Icons.close, size: 16),
-                      onPressed: () =>
-                          setState(() => _connectError = null),
+                      onPressed: () => setState(() => _connectError = null),
                     ),
                   ],
                 ),
               ),
             ),
 
-          // Devices section
           const SliverToBoxAdapter(
             child: Padding(
               padding: EdgeInsets.fromLTRB(16, 24, 16, 8),
               child: Text(
-                '我的设备',
+                'My Devices',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
               ),
             ),
@@ -175,15 +179,14 @@ class _DeviceListPageState extends ConsumerState<DeviceListPage> {
 
           if (_devices.isEmpty)
             SliverList(
-              delegate: SliverChildListDelegate([
-                _EmptyDevicePlaceholder(),
-              ]),
+              delegate: SliverChildListDelegate([_EmptyDevicePlaceholder()]),
             )
           else
             SliverList(
               delegate: SliverChildBuilderDelegate(
                 (context, index) {
                   final device = _devices[index];
+                  final isOnline = _onlineDeviceIds.contains(device.agentId);
                   return Dismissible(
                     key: Key(device.agentId),
                     direction: DismissDirection.endToStart,
@@ -197,7 +200,7 @@ class _DeviceListPageState extends ConsumerState<DeviceListPage> {
                     child: DeviceCard(
                       name: device.deviceName,
                       deviceId: device.agentId,
-                      isOnline: false,
+                      isOnline: isOnline,
                       onTap: () => _connectToDevice(device),
                     ),
                   );
@@ -225,12 +228,9 @@ class _EmptyDevicePlaceholder extends StatelessWidget {
             children: [
               Icon(Icons.add_circle_outline,
                   size: 48,
-                  color: Theme.of(context)
-                      .colorScheme
-                      .primary
-                      .withOpacity(0.5)),
+                  color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.5)),
               const SizedBox(height: 12),
-              const Text('扫描 QR 码添加你的第一台开发机',
+              const Text('Scan QR code or paste pairing URL to add your first device',
                   style: TextStyle(color: Colors.grey)),
             ],
           ),

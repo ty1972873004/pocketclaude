@@ -3,6 +3,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart' as crypto;
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -53,6 +54,39 @@ class _PairingPageState extends ConsumerState<PairingPage> {
     }
   }
 
+  Future<void> _pastePairingUrl() async {
+    final data = await showDialog<String>(
+      context: context,
+      builder: (ctx) {
+        final controller = TextEditingController();
+        return AlertDialog(
+          title: const Text('Paste pairing data'),
+          content: TextField(
+            controller: controller,
+            maxLines: 8,
+            decoration: const InputDecoration(
+              hintText: 'Paste the JSON from pocketclaude-agent pair --json',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            ElevatedButton(onPressed: () => Navigator.pop(ctx, controller.text), child: const Text('Pair')),
+          ],
+        );
+      },
+    );
+
+    if (data == null || data.trim().isEmpty) return;
+
+    try {
+      final json = jsonDecode(data.trim()) as Map<String, dynamic>;
+      _pairWithAgent(json);
+    } catch (e) {
+      setState(() => _error = 'Invalid pairing data: $e');
+    }
+  }
+
   Future<void> _pairWithAgent(Map<String, dynamic> data) async {
     setState(() => _pairing = true);
 
@@ -64,6 +98,8 @@ class _PairingPageState extends ConsumerState<PairingPage> {
           data['ed25519_pub_key'] as String? ?? '';
       final relayUrl = data['relay_url'] as String? ?? '';
       final pairingPort = data['pairing_port'] as int;
+      final tailscaleIP = data['tailscale_ip'] as String? ?? '';
+      final apiPort = data['api_port'] as int? ?? 9090;
 
       // 1. Generate client X25519 key pair
       final x25519 = crypto.X25519();
@@ -119,8 +155,10 @@ class _PairingPageState extends ConsumerState<PairingPage> {
         clientX25519PubKey: base64Encode(clientPubKey.bytes),
         clientX25519PrivKey: base64Encode(clientPrivKeyBytes),
         sharedKeyBase64: base64Encode(sharedSecretBytes),
-        deviceName: 'Dev Machine ($agentId.substring(0, 8))',
+        deviceName: 'Dev Machine (${agentId.substring(0, 8)})',
         pairedAt: DateTime.now().millisecondsSinceEpoch,
+        tailscaleIP: tailscaleIP,
+        directPort: apiPort,
       );
 
       await DeviceStorage.saveDevice(device);
@@ -144,9 +182,11 @@ class _PairingPageState extends ConsumerState<PairingPage> {
 
   @override
   Widget build(BuildContext context) {
+    final showQrScanner = !kIsWeb;
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('添加设备'),
+        title: const Text('Add Device'),
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),
           onPressed: () => context.go('/'),
@@ -154,48 +194,59 @@ class _PairingPageState extends ConsumerState<PairingPage> {
       ),
       body: Column(
         children: [
-          Expanded(
-            flex: 3,
-            child: Stack(
-              children: [
-                MobileScanner(
-                  controller: _scannerController,
-                  onDetect: _onDetect,
-                ),
-                _ScanOverlay(),
-                if (_pairing)
-                  Container(
-                    color: Colors.black54,
-                    child: const Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          CircularProgressIndicator(),
-                          SizedBox(height: 16),
-                          Text('正在配对...',
-                              style: TextStyle(color: Colors.white)),
-                        ],
+          if (showQrScanner)
+            Expanded(
+              flex: 3,
+              child: Stack(
+                children: [
+                  MobileScanner(
+                    controller: _scannerController,
+                    onDetect: _onDetect,
+                  ),
+                  _ScanOverlay(),
+                  if (_pairing)
+                    Container(
+                      color: Colors.black54,
+                      child: const Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            CircularProgressIndicator(),
+                            SizedBox(height: 16),
+                            Text('Pairing...',
+                                style: TextStyle(color: Colors.white)),
+                          ],
+                        ),
                       ),
                     ),
-                  ),
-              ],
+                ],
+              ),
             ),
-          ),
           Expanded(
             flex: 1,
             child: Padding(
               padding: const EdgeInsets.all(24),
               child: Column(
                 children: [
-                  const Text(
-                    '扫描开发机上的 QR 码',
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  Text(
+                    showQrScanner
+                        ? 'Scan QR code on dev machine'
+                        : 'Pair with your dev machine',
+                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    '在开发机上运行 pocketclaude-agent pair 生成 QR 码',
-                    style: TextStyle(color: Colors.grey[400], fontSize: 14),
+                    showQrScanner
+                        ? 'Run pocketclaude-agent pair to generate QR code'
+                        : 'Run pocketclaude-agent pair --json and paste the output below',
+                    style: const TextStyle(color: Colors.grey, fontSize: 14),
                     textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 12),
+                  OutlinedButton.icon(
+                    onPressed: _pastePairingUrl,
+                    icon: const Icon(Icons.paste, size: 16),
+                    label: const Text('Paste pairing URL'),
                   ),
                   if (_error != null) ...[
                     const SizedBox(height: 12),
@@ -209,7 +260,7 @@ class _PairingPageState extends ConsumerState<PairingPage> {
                         });
                         _scannerController.start();
                       },
-                      child: const Text('重试'),
+                      child: const Text('Retry'),
                     ),
                   ],
                 ],

@@ -11,6 +11,8 @@ class PairedDevice {
   final String sharedKeyBase64;
   final String deviceName;
   final int pairedAt;
+  final String tailscaleIP;
+  final int directPort;
 
   PairedDevice({
     required this.agentId,
@@ -23,6 +25,8 @@ class PairedDevice {
     required this.sharedKeyBase64,
     this.deviceName = 'Development Machine',
     required this.pairedAt,
+    this.tailscaleIP = '',
+    this.directPort = 9090,
   });
 
   Map<String, dynamic> toJson() => {
@@ -36,6 +40,8 @@ class PairedDevice {
         'shared_key_base64': sharedKeyBase64,
         'device_name': deviceName,
         'paired_at': pairedAt,
+        'tailscale_ip': tailscaleIP,
+        'direct_port': directPort,
       };
 
   factory PairedDevice.fromJson(Map<String, dynamic> json) => PairedDevice(
@@ -49,6 +55,8 @@ class PairedDevice {
         sharedKeyBase64: json['shared_key_base64'] as String,
         deviceName: json['device_name'] as String? ?? 'Development Machine',
         pairedAt: json['paired_at'] as int,
+        tailscaleIP: json['tailscale_ip'] as String? ?? '',
+        directPort: json['direct_port'] as int? ?? 9090,
       );
 
   String toJsonString() => jsonEncode(toJson());

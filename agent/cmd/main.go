@@ -159,9 +159,18 @@ func startCmd() *cobra.Command {
 				}
 			}
 
-			// Initialize PTY manager
+			// Initialize PTY manager with session persistence
 			ptyMgr := pty.NewManager()
 			defer ptyMgr.CloseAll()
+
+			configDir, _ := crypto.DefaultConfigDir()
+			if configDir != "" {
+				store := pty.NewSessionStore(configDir)
+				ptyMgr.SetStore(store)
+				if err := ptyMgr.RestoreSessions(); err != nil {
+					log.Printf("[Agent] Warning: failed to restore sessions: %v", err)
+				}
+			}
 
 			// Initialize API handler
 			handler := api.NewHandler(ptyMgr)
@@ -174,7 +183,7 @@ func startCmd() *cobra.Command {
 				w.Write([]byte(`{"status":"ok"}`))
 			})
 
-			addr := fmt.Sprintf("127.0.0.1:%d", cfg.APIPort)
+			addr := fmt.Sprintf("0.0.0.0:%d", cfg.APIPort)
 			server := &http.Server{Addr: addr, Handler: mux}
 
 			go func() {
